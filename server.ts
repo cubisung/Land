@@ -824,7 +824,7 @@ async function startServer() {
       );
 
       try {
-        const { sendEmailWithResend } = await import("./lib/email");
+        const { sendEmailWithResend } = await import("./src/lib/email");
 
         const resendResult = await sendEmailWithResend({
           to: to.trim(),
