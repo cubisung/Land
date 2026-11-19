@@ -18,7 +18,13 @@ async function startServer() {
   if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
   }
-  app.use("/uploads", express.static(uploadsDir));
+
+  // Serve local uploads only when Firebase Storage is not configured.
+  // When FIREBASE_SERVICE_ACCOUNT_JSON is set, uploads go to Firebase Storage
+  // and are served from there, so we keep /uploads unavailable in that mode.
+  if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    app.use("/uploads", express.static(uploadsDir));
+  }
 
   // Make Resend key available to the email module only when it is set.
   // Do not log the key value anywhere.
@@ -85,25 +91,97 @@ async function startServer() {
     }
   });
 
-  // Base64 JSON Document & PDF Upload API (Up to 35MB fallback)
-  app.post("/api/upload-document", (req, res) => {
+  // Google Cloud Storage-backed Document & PDF Upload API
+  // Files are stored in Firebase Storage so they survive Render restarts/redeploys.
+  app.post("/api/upload-document", async (req, res) => {
     try {
       const { fileName, fileType, fileData, fileSize } = req.body;
       if (!fileName || !fileData) {
         return res.status(400).json({ error: "Thiếu dữ liệu tệp tin" });
       }
 
-      // Sanitize filename
+      let buffer: Buffer;
+      let remoteUrl: string | null = null;
+
+      // Try Firebase Storage first when credentials are available.
+      if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        try {
+          // Initialize Firebase Admin once per process, lazily.
+          let storage: ReturnType<typeof getStorage>;
+
+          try {
+            const { getStorage } = await import("firebase-admin/storage");
+            storage = getStorage();
+          } catch {
+            const { initializeApp, cert, applicationDefault } = await import("firebase-admin/app");
+            const { getStorage: getAdminStorage } = await import("firebase-admin/storage");
+
+            if (getApps().length === 0) {
+              const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+              if (serviceAccountJson) {
+                initializeApp({
+                  credential: cert(JSON.parse(serviceAccountJson)),
+                  storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
+                });
+              } else {
+                initializeApp({
+                  credential: applicationDefault(),
+                  storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
+                });
+              }
+            }
+
+            storage = getAdminStorage();
+          }
+
+          const ext = path.extname(fileName) || (fileType === "application/pdf" ? ".pdf" : "");
+          const baseName = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1E00-\u1EFF-]/g, "_").slice(0, 50);
+          const safeFileName = `${Date.now()}_${baseName}${ext}`;
+
+          const base64Data = fileData.replace(/^data:[^;]+;base64,/, "");
+          buffer = Buffer.from(base64Data, "base64");
+
+          if (buffer.length > 35 * 1024 * 1024) {
+            return res.status(413).json({ error: "Tệp tin vượt quá dung lượng tối đa 35MB" });
+          }
+
+          const bucket = storage.bucket();
+          const file = bucket.file(`documents/${safeFileName}`);
+
+          await file.save(buffer, {
+            contentType: fileType || "application/octet-stream",
+            metadata: {
+              contentType: fileType || "application/octet-stream",
+              cacheControl: "public, max-age=31536000",
+            },
+          });
+
+          await file.makePublic();
+
+          remoteUrl = `https://storage.googleapis.com/${bucket.name}/${file.name}`;
+
+          return res.json({
+            success: true,
+            fileUrl: remoteUrl,
+            name: fileName,
+            type: fileType || "application/octet-stream",
+            size: buffer.length,
+            storedIn: "firebaseStorage",
+          });
+        } catch (storageErr: any) {
+          console.error("Firebase Storage upload failed, falling back to local disk:", storageErr?.message);
+        }
+      }
+
+      // Fallback: save locally on the transient disk
       const ext = path.extname(fileName) || (fileType === "application/pdf" ? ".pdf" : "");
       const baseName = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1E00-\u1EFF-]/g, "_").slice(0, 50);
       const safeFileName = `${Date.now()}_${baseName}${ext}`;
       const filePath = path.join(uploadsDir, safeFileName);
 
-      // Extract base64 payload
       const base64Data = fileData.replace(/^data:[^;]+;base64,/, "");
-      const buffer = Buffer.from(base64Data, "base64");
+      buffer = Buffer.from(base64Data, "base64");
 
-      // Verify max 35MB
       if (buffer.length > 35 * 1024 * 1024) {
         return res.status(413).json({ error: "Tệp tin vượt quá dung lượng tối đa 35MB" });
       }
@@ -117,6 +195,7 @@ async function startServer() {
         name: fileName,
         type: fileType || "application/octet-stream",
         size: buffer.length,
+        storedIn: "localDisk",
       });
     } catch (err: any) {
       console.error("Upload document error:", err);
