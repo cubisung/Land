@@ -20,6 +20,12 @@ async function startServer() {
   }
   app.use("/uploads", express.static(uploadsDir));
 
+  // Make Resend key available to the email module only when it is set.
+  // Do not log the key value anywhere.
+  if (process.env.RESEND_API_KEY) {
+    process.env.RESEND_API_KEY = process.env.RESEND_API_KEY;
+  }
+
   // Streaming Raw Document & PDF Upload API (Direct binary stream, zero base64 RAM overhead, up to 35MB)
   app.post("/api/upload-document-raw", (req, res) => {
     try {
@@ -796,10 +802,6 @@ async function startServer() {
         attachedImages = [],
         attachedDocuments = [],
         qrDataUrl,
-        smtpHost,
-        smtpPort,
-        smtpUser,
-        smtpPass,
       } = req.body;
 
       if (!to || typeof to !== "string" || !to.trim()) {
@@ -811,67 +813,109 @@ async function startServer() {
 
       const assetTitle = subject || "Thông tin Bất động sản & Mã QR";
 
-      // Configure Transporter
-      let transporter: nodemailer.Transporter;
+      // Build Documents payload
+      const documentsPayload = (attachedDocuments || []).map(
+        (doc: any) => ({
+          name: doc.name || "Tài liệu",
+          url: doc.url || null,
+          size: doc.size || 0,
+          type: doc.type || "application/octet-stream",
+        }),
+      );
 
-      // 1. Check user provided or process environment SMTP credentials
-      const host = smtpHost || process.env.SMTP_HOST;
-      const port = Number(smtpPort || process.env.SMTP_PORT || 587);
-      const user = smtpUser || process.env.SMTP_USER;
-      const pass = smtpPass || process.env.SMTP_PASS;
+      try {
+        const { sendEmailWithResend } = await import("./lib/email");
 
-      if (host && user && pass) {
-        transporter = nodemailer.createTransport({
-          host,
-          port,
-          secure: port === 465,
-          auth: { user, pass },
+        const resendResult = await sendEmailWithResend({
+          to: to.trim(),
+          senderEmail: senderEmail?.trim() || undefined,
+          subject: `[Thông Tin Tài Sản] ${assetTitle}`,
+          message: message || "",
+          htmlContent: undefined,
+          attachedImages:
+            attachedImages.length > 0
+              ? attachedImages.map((img: string) => ({ name: "Ảnh", url: img }))
+              : undefined,
+          attachedDocuments: documentsPayload.length > 0 ? documentsPayload : undefined,
+          qrCid: "qrcode_asset_image",
+          qrDataUrl: qrDataUrl || undefined,
         });
-      } else {
-        // 2. Fallback to Ethereal Test Account for immediate simulation/sending
-        try {
-          const testAccount = await nodemailer.createTestAccount();
-          transporter = nodemailer.createTransport({
-            host: "smtp.ethereal.email",
-            port: 587,
-            secure: false,
-            auth: {
-              user: testAccount.user,
-              pass: testAccount.pass,
-            },
-          });
-        } catch (e) {
-          console.warn("Failed to create test email account, using JSON transport fallback", e);
-          transporter = nodemailer.createTransport({
-            jsonTransport: true,
-          });
+
+        const { data, error } = resendResult;
+
+        if (error) {
+          throw new Error(error.message || "Resend returned an error.");
         }
-      }
 
-      // Convert QR Data URL to Mail Attachment
-      const attachments: any[] = [];
-      let qrCid = "";
+        return res.json({
+          success: true,
+          message: `Đã tự động gửi email thành công tới ${to}!`,
+          messageId: data?.id || null,
+          previewUrl: null,
+        });
+      } catch (backendErr: any) {
+        // If Resend failed because the key is missing or SMTP is the only option,
+        // fall back to the legacy Nodemailer path so existing calls still have a chance.
+        console.warn("Resend email failed, falling back to Nodemailer:", backendErr);
 
-      if (qrDataUrl && qrDataUrl.startsWith("data:image/")) {
-        const matches = qrDataUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
-        if (matches && matches[2]) {
-          const mimeType = matches[1] || "image/png";
-          const base64Data = matches[2];
-          qrCid = "qrcode_asset_image";
+        let transporter: nodemailer.Transporter;
 
-          attachments.push({
-            filename: `QR_${assetTitle.replace(/[^a-zA-Z0-9]/g, "_")}.png`,
-            content: Buffer.from(base64Data, "base64"),
-            contentType: mimeType,
-            cid: qrCid,
+        const host = process.env.SMTP_HOST;
+        const port = Number(process.env.SMTP_PORT || 587);
+        const user = process.env.SMTP_USER;
+        const pass = process.env.SMTP_PASS;
+
+        if (host && user && pass) {
+          transporter = nodemailer.createTransport({
+            host,
+            port,
+            secure: port === 465,
+            auth: { user, pass },
           });
+        } else {
+          try {
+            const testAccount = await nodemailer.createTestAccount();
+            transporter = nodemailer.createTransport({
+              host: "smtp.ethereal.email",
+              port: 587,
+              secure: false,
+              auth: {
+                user: testAccount.user,
+                pass: testAccount.pass,
+              },
+            });
+          } catch (e) {
+            console.warn("Failed to create test email account, using JSON transport fallback", e);
+            transporter = nodemailer.createTransport({
+              jsonTransport: true,
+            });
+          }
         }
-      }
 
-      // Format attached images
-      const imagesHtml =
-        attachedImages && attachedImages.length > 0
-          ? `
+        // Convert QR Data URL to Mail Attachment
+        const attachments: any[] = [];
+        let qrCid = "";
+
+        if (qrDataUrl && qrDataUrl.startsWith("data:image/")) {
+          const matches = qrDataUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+          if (matches && matches[2]) {
+            const mimeType = matches[1] || "image/png";
+            const base64Data = matches[2];
+            qrCid = "qrcode_asset_image";
+
+            attachments.push({
+              filename: `QR_${assetTitle.replace(/[^a-zA-Z0-9]/g, "_")}.png`,
+              content: Buffer.from(base64Data, "base64"),
+              contentType: mimeType,
+              cid: qrCid,
+            });
+          }
+        }
+
+        // Format attached images
+        const imagesHtml =
+          attachedImages && attachedImages.length > 0
+            ? `
           <div style="margin-top: 20px;">
             <p style="font-weight: bold; color: #1e293b; margin-bottom: 10px;">📷 Hình ảnh thực tế đính kèm (${attachedImages.length} ảnh):</p>
             <div style="display: flex; flex-wrap: wrap; gap: 10px;">
@@ -887,12 +931,12 @@ async function startServer() {
             </div>
           </div>
         `
-          : "";
+            : "";
 
-      // Format attached documents/PDFs
-      const documentsHtml =
-        attachedDocuments && attachedDocuments.length > 0
-          ? `
+        // Format attached documents/PDFs
+        const documentsHtml =
+          attachedDocuments && attachedDocuments.length > 0
+            ? `
           <div style="margin-top: 20px;">
             <p style="font-weight: bold; color: #1e293b; margin-bottom: 10px;">📋 Hồ sơ tài liệu & File PDF đính kèm (${attachedDocuments.length} tệp):</p>
             <div style="display: flex; flex-direction: column; gap: 6px;">
@@ -909,69 +953,61 @@ async function startServer() {
             </div>
           </div>
         `
-          : "";
+            : "";
 
-      // Construct Professional HTML Mail Body
-      const htmlContent = `
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="utf-8">
-        </head>
-        <body style="font-family: 'Segoe UI', Arial, sans-serif; background-color: #f8fafc; color: #1e293b; margin: 0; padding: 20px;">
-          <div style="max-width: 620px; margin: 0 auto; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.08);">
-            
-            <!-- Header -->
-            <div style="background-color: #00529C; color: #ffffff; padding: 24px; text-align: center;">
-              <h1 style="margin: 0; font-size: 20px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px;">THÔNG TIN TÀI SẢN & MÃ QR</h1>
-              <p style="margin: 6px 0 0 0; opacity: 0.9; font-size: 13px;">Hệ thống Quản lý Tài sản & Mã QR VietinBank</p>
-            </div>
-
-            <div style="padding: 24px;">
-              <!-- Title Badge -->
-              <div style="background-color: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px; padding: 12px 16px; margin-bottom: 20px;">
-                <span style="font-size: 11px; font-weight: bold; text-transform: uppercase; color: #00529C; display: block; margin-bottom: 2px;">📌 Tên Tài Sản</span>
-                <span style="font-size: 16px; font-weight: bold; color: #0f172a;">${assetTitle}</span>
+        // Construct Professional HTML Mail Body
+        const htmlContent = `
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+          </head>
+          <body style="font-family: 'Segoe UI', Arial, sans-serif; background-color: #f8fafc; color: #1e293b; margin: 0; padding: 20px;">
+            <div style="max-width: 620px; margin: 0 auto; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.08);">
+              <div style="background-color: #00529C; color: #ffffff; padding: 24px; text-align: center;">
+                <h1 style="margin: 0; font-size: 20px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px;">THÔNG TIN TÀI SẢN & MÃ QR</h1>
+                <p style="margin: 6px 0 0 0; opacity: 0.9; font-size: 13px;">Hệ thống Quản lý Tài sản & Mã QR VietinBank</p>
               </div>
-
-              <!-- QR Code Card -->
-              ${
-                qrCid
-                  ? `
+              <div style="padding: 24px;">
+                <div style="background-color: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px; padding: 12px 16px; margin-bottom: 20px;">
+                  <span style="font-size: 11px; font-weight: bold; text-transform: uppercase; color: #00529C; display: block; margin-bottom: 2px;">📌 Tên Tài Sản</span>
+                  <span style="font-size: 16px; font-weight: bold; color: #0f172a;">${assetTitle}</span>
+                </div>
+                ${
+                  qrCid
+                    ? `
                 <div style="text-align: center; background-color: #f1f5f9; padding: 20px; border-radius: 12px; border: 1px dashed #cbd5e1; margin-bottom: 20px;">
                   <p style="margin: 0 0 12px 0; font-size: 12px; font-weight: bold; color: #475569;">MÃ QR CODE TÀI SẢN</p>
                   <img src="cid:${qrCid}" alt="Mã QR" style="max-width: 200px; height: auto; border-radius: 8px; border: 1px solid #cbd5e1; box-shadow: 0 4px 10px rgba(0,0,0,0.08);" />
                   <p style="margin: 10px 0 0 0; font-size: 11px; color: #64748b;">(Quét mã bằng camera điện thoại hoặc Zalo để mở liên kết)</p>
                 </div>
               `
-                  : ""
-              }
-
-              <!-- Asset Information Table -->
-              <table style="width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px;">
-                ${
-                  marketValue
-                    ? `
+                    : ""
+                }
+                <table style="width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px;">
+                  ${
+                    marketValue
+                      ? `
                   <tr>
                     <td style="padding: 10px 12px; border-bottom: 1px solid #f1f5f9; font-weight: bold; color: #475569; width: 35%; background-color: #f8fafc;">💰 Giá ước tính</td>
                     <td style="padding: 10px 12px; border-bottom: 1px solid #f1f5f9; color: #b45309; font-weight: bold; font-size: 15px;">${marketValue}</td>
                   </tr>
                 `
-                    : ""
-                }
-                ${
-                  coordinates
-                    ? `
+                      : ""
+                  }
+                  ${
+                    coordinates
+                      ? `
                   <tr>
                     <td style="padding: 10px 12px; border-bottom: 1px solid #f1f5f9; font-weight: bold; color: #475569; background-color: #f8fafc;">📍 Tọa độ GPS</td>
                     <td style="padding: 10px 12px; border-bottom: 1px solid #f1f5f9; color: #047857; font-weight: bold; font-family: monospace;">${coordinates}</td>
                   </tr>
                 `
-                    : ""
-                }
-                ${
-                  rawContent
-                    ? `
+                      : ""
+                  }
+                  ${
+                    rawContent
+                      ? `
                   <tr>
                     <td style="padding: 10px 12px; border-bottom: 1px solid #f1f5f9; font-weight: bold; color: #475569; background-color: #f8fafc;">🔗 Link / Nội dung QR</td>
                     <td style="padding: 10px 12px; border-bottom: 1px solid #f1f5f9; color: #0284c7; word-break: break-all;">
@@ -979,13 +1015,12 @@ async function startServer() {
                     </td>
                   </tr>
                 `
-                    : ""
-                }
-              </table>
-
-              ${
-                coordinates
-                  ? `
+                      : ""
+                  }
+                </table>
+                ${
+                  coordinates
+                    ? `
                 <div style="margin-top: 15px; text-align: center;">
                   <a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(coordinates.replace("@", ""))}" 
                      target="_blank" 
@@ -994,40 +1029,32 @@ async function startServer() {
                   </a>
                 </div>
               `
-                  : ""
-              }
-
-              <!-- Attached Images -->
-              ${imagesHtml}
-
-              <!-- Attached Documents & PDFs -->
-              ${documentsHtml}
-
-              <!-- Custom Note -->
-              ${
-                message
-                  ? `
+                    : ""
+                }
+                ${imagesHtml}
+                ${documentsHtml}
+                ${
+                  message
+                    ? `
                 <div style="margin-top: 20px; background-color: #f8fafc; border-left: 4px solid #00529C; padding: 12px 16px; border-radius: 0 8px 8px 0;">
                   <p style="margin: 0 0 4px 0; font-size: 11px; font-weight: bold; color: #00529C; text-transform: uppercase;">📝 Ghi chú gửi kèm:</p>
                   <p style="margin: 0; font-size: 13px; color: #334155; white-space: pre-line;">${message}</p>
                 </div>
               `
-                  : ""
-              }
+                    : ""
+                }
+              </div>
+              <div style="background-color: #f1f5f9; padding: 16px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #e2e8f0;">
+                <p style="margin: 0 0 4px 0;">Thư này được tạo tự động từ ứng dụng Quản lý Tài sản QR VietinBank.</p>
+                ${senderEmail ? `<p style="margin: 0; font-weight: bold; color: #334155;">Người gửi: ${senderEmail}</p>` : ""}
+              </div>
             </div>
+          </body>
+          </html>
+        `;
 
-            <!-- Footer -->
-            <div style="background-color: #f1f5f9; padding: 16px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #e2e8f0;">
-              <p style="margin: 0 0 4px 0;">Thư này được tạo tự động từ ứng dụng Quản lý Tài sản QR VietinBank.</p>
-              ${senderEmail ? `<p style="margin: 0; font-weight: bold; color: #334155;">Người gửi: ${senderEmail}</p>` : ""}
-            </div>
-          </div>
-        </body>
-        </html>
-      `;
-
-      // Plain text fallback
-      const textBody = `THÔNG TIN TÀI SẢN & MÃ QR
+        // Plain text fallback
+        const textBody = `THÔNG TIN TÀI SẢN & MÃ QR
 ========================================
 Tên tài sản: ${assetTitle}
 Link QR: ${rawContent || "N/A"}
@@ -1036,29 +1063,29 @@ Giá ước tính: ${marketValue || "N/A"}
 ${message ? `\nGhi chú: ${message}\n` : ""}
 ========================================`;
 
-      const mailOptions = {
-        from: senderEmail
-          ? `VietinBank Asset QR <${senderEmail}>`
-          : '"VietinBank Asset QR" <no-reply@vietinbank.com>',
-        to: to.trim(),
-        subject: `[Thông Tin Tài Sản] ${assetTitle}`,
-        text: textBody,
-        html: htmlContent,
-        attachments,
-      };
+        const mailOptions = {
+          from: senderEmail
+            ? `VietinBank Asset QR <${senderEmail}>`
+            : '"VietinBank Asset QR" <no-reply@vietinbank.com>',
+          to: to.trim(),
+          subject: `[Thông Tin Tài Sản] ${assetTitle}`,
+          text: textBody,
+          html: htmlContent,
+          attachments,
+        };
 
-      const info = await transporter.sendMail(mailOptions);
-      console.log("Email sent successfully:", info.messageId);
+        const info = await transporter.sendMail(mailOptions);
+        console.log("Email sent successfully:", info.messageId);
 
-      // Get preview URL if Ethereal test account was used
-      const previewUrl = nodemailer.getTestMessageUrl(info);
+        const previewUrl = nodemailer.getTestMessageUrl(info);
 
-      return res.json({
-        success: true,
-        message: `Đã tự động gửi email thành công tới ${to}!`,
-        messageId: info.messageId,
-        previewUrl: previewUrl || null,
-      });
+        return res.json({
+          success: true,
+          message: `Đã tự động gửi email thành công tới ${to}!`,
+          messageId: info.messageId,
+          previewUrl: previewUrl || null,
+        });
+      }
     } catch (err: any) {
       console.error("Error sending email:", err);
       return res.status(500).json({
