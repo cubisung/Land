@@ -1,0 +1,6 @@
+{
+  "name": "Hệ thống hỗ trợ định giá",
+  "description": "Hệ thống hỗ trợ định giá tài sản & tạo mã QR Code",
+  "requestFramePermissions": ["geolocation", "camera", "clipboard-read", "clipboard-write"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

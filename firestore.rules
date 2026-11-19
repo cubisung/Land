@@ -1,0 +1,33 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Hồ sơ người dùng: chỉ chính chủ đọc/ghi; admin được đọc để quản lý.
+    match /users/{userId} {
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      // Người dùng không được tự đổi quyền (role/status); chỉ admin mới đổi được.
+      allow create: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.role == 'member'
+        && request.resource.data.status == 'approved';
+      allow update: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.status == resource.data.status;
+      allow delete: if false;
+    }
+
+    // Mã QR: chỉ người đã đăng nhập mới đọc/ghi.
+    match /saved_qrs/{document} {
+      allow read, write: if isSignedIn();
+    }
+  }
+}

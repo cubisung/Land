@@ -1,0 +1,36 @@
+{
+  "entities": {
+    "users": {
+      "title": "User Profiles",
+      "description": "User account information and approval status",
+      "fields": {
+        "uid": { "type": "string", "description": "Firebase Auth User ID" },
+        "username": { "type": "string", "description": "Display username" },
+        "email": { "type": "string", "description": "User email" },
+        "role": { "type": "string", "description": "User role: admin or member" },
+        "status": { "type": "string", "description": "Approval status: approved, pending, or rejected" },
+        "createdAt": { "type": "number", "description": "Creation timestamp in millis" }
+      }
+    },
+    "saved_qrs": {
+      "title": "Saved QR Codes",
+      "description": "Cloud collection storing saved QR codes and valuation export logs",
+      "fields": {
+        "title": { "type": "string", "description": "Title or custom label" },
+        "rawString": { "type": "string", "description": "Encoded QR string content" },
+        "type": { "type": "string", "description": "QR type identifier" },
+        "options": { "type": "map", "description": "Visual customization settings" },
+        "createdAt": { "type": "number", "description": "Creation timestamp in millis" },
+        "createdByUid": { "type": "string", "description": "UID of creator" },
+        "creatorName": { "type": "string", "description": "Username of creator" },
+        "isPublic": { "type": "boolean", "description": "Public sharing toggle" },
+        "marketValue": { "type": "string", "description": "Asset market valuation price" },
+        "attachedImages": { "type": "list", "description": "Array of base64 compressed images" },
+        "coordinates": { "type": "string", "description": "GPS coordinates string" },
+        "actionType": { "type": "string", "description": "Action type: save, export_pdf, or both" },
+        "lastExportedAt": { "type": "number", "description": "Timestamp of last PDF export" },
+        "reportCode": { "type": "string", "description": "Valuation report code" }
+      }
+    }
+  }
+}

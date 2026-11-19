@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Local runtime data and uploads (not for GitHub)
+data/
+public/uploads/
+tunnel.pid
+.freebuff/
