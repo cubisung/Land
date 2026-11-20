@@ -19,10 +19,10 @@ async function startServer() {
     fs.mkdirSync(uploadsDir, { recursive: true });
   }
 
-  // Serve local uploads only when Firebase Storage is not configured.
-  // When FIREBASE_SERVICE_ACCOUNT_JSON is set, uploads go to Firebase Storage
-  // and are served from there, so we keep /uploads unavailable in that mode.
-  if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+  // Serve local uploads only when Firebase credentials are not configured.
+  // When credentials are set, uploads go to Firestore and are served via
+  // /api/document-file/:docId, so /uploads stays unavailable in that mode.
+  if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON && !process.env.GOOGLE_APPLICATION_CREDENTIALS) {
     app.use("/uploads", express.static(uploadsDir));
   }
 
@@ -43,15 +43,9 @@ async function startServer() {
     if (getApps().length === 0) {
       const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
       if (serviceAccountJson) {
-        initializeApp({
-          credential: cert(JSON.parse(serviceAccountJson)),
-          storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
-        });
+        initializeApp({ credential: cert(JSON.parse(serviceAccountJson)) });
       } else {
-        initializeApp({
-          credential: applicationDefault(),
-          storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
-        });
+        initializeApp({ credential: applicationDefault() });
       }
     }
     firestoreInstance = getFirestore();
@@ -158,51 +152,6 @@ async function startServer() {
           }
         }
 
-        // Next try Firebase Storage when credentials are available (needs Storage enabled).
-        if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-          try {
-            const { initializeApp, cert, applicationDefault, getApps } = await import("firebase-admin/app");
-            const { getStorage } = await import("firebase-admin/storage");
-
-            if (getApps().length === 0) {
-              const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-              if (serviceAccountJson) {
-                initializeApp({
-                  credential: cert(JSON.parse(serviceAccountJson)),
-                  storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
-                });
-              } else {
-                initializeApp({
-                  credential: applicationDefault(),
-                  storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
-                });
-              }
-            }
-
-            const bucket = getStorage().bucket();
-            const file = bucket.file(`documents/${safeFileName}`);
-            await file.save(buffer, {
-              contentType: fileType || "application/octet-stream",
-              metadata: {
-                contentType: fileType || "application/octet-stream",
-                cacheControl: "public, max-age=31536000",
-              },
-            });
-            await file.makePublic();
-
-            return res.json({
-              success: true,
-              fileUrl: `https://storage.googleapis.com/${bucket.name}/${file.name}`,
-              name: fileName,
-              type: fileType || "application/octet-stream",
-              size: buffer.length,
-              storedIn: "firebaseStorage",
-            });
-          } catch (storageErr: any) {
-            console.error("Firebase Storage upload failed, falling back to local disk:", storageErr?.message);
-          }
-        }
-
         // Fallback: save locally on the transient disk
         fs.writeFileSync(filePath, buffer);
         return res.json({
@@ -229,8 +178,8 @@ async function startServer() {
     }
   });
 
-  // Google Cloud Storage-backed Document & PDF Upload API
-  // Files are stored in Firebase Storage so they survive Render restarts/redeploys.
+  // Firestore-backed Document & PDF Upload API (JSON base64)
+  // Files are stored in Firestore so they survive Render restarts/redeploys.
   app.post("/api/upload-document", async (req, res) => {
     try {
       const { fileName, fileType, fileData, fileSize } = req.body;
@@ -239,7 +188,6 @@ async function startServer() {
       }
 
       let buffer: Buffer;
-      let remoteUrl: string | null = null;
 
       // Try Firestore first when credentials are available (works on free Spark plan).
       if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
@@ -263,76 +211,6 @@ async function startServer() {
           });
         } catch (fsErr: any) {
           console.error("Firestore document save failed, trying next store:", fsErr?.message);
-        }
-      }
-
-      // Next try Firebase Storage when credentials are available (needs Storage enabled).
-      if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-        try {
-          // Initialize Firebase Admin once per process, lazily.
-          let storage: ReturnType<typeof getStorage>;
-
-          try {
-            const { getStorage } = await import("firebase-admin/storage");
-            storage = getStorage();
-          } catch {
-            const { initializeApp, cert, applicationDefault, getApps } = await import("firebase-admin/app");
-            const { getStorage: getAdminStorage } = await import("firebase-admin/storage");
-
-            if (getApps().length === 0) {
-              const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-              if (serviceAccountJson) {
-                initializeApp({
-                  credential: cert(JSON.parse(serviceAccountJson)),
-                  storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
-                });
-              } else {
-                initializeApp({
-                  credential: applicationDefault(),
-                  storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
-                });
-              }
-            }
-
-            storage = getAdminStorage();
-          }
-
-          const ext = path.extname(fileName) || (fileType === "application/pdf" ? ".pdf" : "");
-          const baseName = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1E00-\u1EFF-]/g, "_").slice(0, 50);
-          const safeFileName = `${Date.now()}_${baseName}${ext}`;
-
-          const base64Data = fileData.replace(/^data:[^;]+;base64,/, "");
-          buffer = Buffer.from(base64Data, "base64");
-
-          if (buffer.length > 35 * 1024 * 1024) {
-            return res.status(413).json({ error: "Tệp tin vượt quá dung lượng tối đa 35MB" });
-          }
-
-          const bucket = storage.bucket();
-          const file = bucket.file(`documents/${safeFileName}`);
-
-          await file.save(buffer, {
-            contentType: fileType || "application/octet-stream",
-            metadata: {
-              contentType: fileType || "application/octet-stream",
-              cacheControl: "public, max-age=31536000",
-            },
-          });
-
-          await file.makePublic();
-
-          remoteUrl = `https://storage.googleapis.com/${bucket.name}/${file.name}`;
-
-          return res.json({
-            success: true,
-            fileUrl: remoteUrl,
-            name: fileName,
-            type: fileType || "application/octet-stream",
-            size: buffer.length,
-            storedIn: "firebaseStorage",
-          });
-        } catch (storageErr: any) {
-          console.error("Firebase Storage upload failed, falling back to local disk:", storageErr?.message);
         }
       }
 
