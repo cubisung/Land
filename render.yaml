@@ -1,3 +1,5 @@
+# PDFs/documents are stored in Firestore via /api/document-file/:docId,
+# which works on the free Spark plan (no Firebase Storage bucket needed).
 services:
   - type: web
     name: he-thong-dinh-gia-qr-code
