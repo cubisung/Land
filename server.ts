@@ -32,9 +32,83 @@ async function startServer() {
     process.env.RESEND_API_KEY = process.env.RESEND_API_KEY;
   }
 
+  // --- Firestore document store (durable on the free Spark plan, no Storage upgrade needed) ---
+  // Firestore caps a single document at 1 MiB, so a file is split into ~400 KB
+  // raw chunks (base64 inside each chunk document) under documents/{docId}/chunks.
+  let firestoreInstance: any = null;
+  async function getFirestoreAdmin() {
+    if (firestoreInstance) return firestoreInstance;
+    const { initializeApp, cert, applicationDefault, getApps } = await import("firebase-admin/app");
+    const { getFirestore } = await import("firebase-admin/firestore");
+    if (getApps().length === 0) {
+      const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+      if (serviceAccountJson) {
+        initializeApp({
+          credential: cert(JSON.parse(serviceAccountJson)),
+          storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
+        });
+      } else {
+        initializeApp({
+          credential: applicationDefault(),
+          storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
+        });
+      }
+    }
+    firestoreInstance = getFirestore();
+    return firestoreInstance;
+  }
+
+  async function saveDocumentToFirestore(buffer: Buffer, fileName: string, fileType: string, docId: string) {
+    const db = await getFirestoreAdmin();
+    const b64ChunkLen = Math.ceil((400 * 1024) / 3) * 4;
+    const base64 = buffer.toString("base64");
+    const chunks: string[] = [];
+    for (let i = 0; i < base64.length; i += b64ChunkLen) {
+      chunks.push(base64.slice(i, i + b64ChunkLen));
+    }
+    if (chunks.length === 0) chunks.push("");
+    const metaRef = db.collection("documents").doc(docId);
+    await metaRef.set({
+      fileName,
+      fileType: fileType || "application/octet-stream",
+      size: buffer.length,
+      chunkCount: chunks.length,
+      createdAt: Date.now(),
+    });
+    for (let i = 0; i < chunks.length; i++) {
+      await metaRef.collection("chunks").doc(String(i).padStart(6, "0")).set({ index: i, data: chunks[i] });
+    }
+    return `/api/document-file/${encodeURIComponent(docId)}`;
+  }
+
+  // Download a document previously stored in Firestore (reassembles the chunks).
+  app.get("/api/document-file/:docId", async (req, res) => {
+    try {
+      const docId = path.basename(decodeURIComponent(req.params.docId));
+      const db = await getFirestoreAdmin();
+      const metaRef = db.collection("documents").doc(docId);
+      const snap = await metaRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: "Không tìm thấy tài liệu" });
+      }
+      const meta = snap.data();
+      const chunksSnap = await metaRef.collection("chunks").orderBy("index").get();
+      const parts: Buffer[] = [];
+      chunksSnap.forEach((c: any) => parts.push(Buffer.from(c.data().data || "", "base64")));
+      const buffer = Buffer.concat(parts);
+      res.setHeader("Content-Type", meta.fileType || "application/octet-stream");
+      res.setHeader("Content-Length", buffer.length);
+      res.setHeader("Content-Disposition", `inline; filename="${String(meta.fileName || docId).replace(/"/g, "")}"`);
+      return res.send(buffer);
+    } catch (err: any) {
+      console.error("Download document error:", err?.message);
+      return res.status(500).json({ error: "Lỗi đọc tài liệu: " + err?.message });
+    }
+  });
+
   // Streaming Raw Document & PDF Upload API (Direct binary stream, zero base64 RAM overhead, up to 35MB)
-  // When FIREBASE_SERVICE_ACCOUNT_JSON is set, the file is stored in Firebase
-  // Storage (survives Render restarts); otherwise it falls back to local disk.
+  // When Firebase credentials are set, the file is stored in Firestore (survives
+  // Render restarts, works on the free Spark plan); otherwise it falls back to local disk.
   app.post("/api/upload-document-raw", async (req, res) => {
     try {
       const rawName = (req.query.fileName as string) || (req.headers["x-file-name"] as string) || "tailieu.pdf";
@@ -67,7 +141,24 @@ async function startServer() {
         if (limitExceeded) return;
         const buffer = Buffer.concat(chunks);
 
-        // Prefer Firebase Storage when credentials are available.
+        // Prefer Firestore (durable on the free Spark plan, no Storage bucket needed).
+        if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+          try {
+            const fileUrl = await saveDocumentToFirestore(buffer, fileName, fileType, safeFileName);
+            return res.json({
+              success: true,
+              fileUrl,
+              name: fileName,
+              type: fileType || "application/octet-stream",
+              size: buffer.length,
+              storedIn: "firestore",
+            });
+          } catch (fsErr: any) {
+            console.error("Firestore document save failed, trying next store:", fsErr?.message);
+          }
+        }
+
+        // Next try Firebase Storage when credentials are available (needs Storage enabled).
         if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
           try {
             const { initializeApp, cert, applicationDefault, getApps } = await import("firebase-admin/app");
@@ -150,7 +241,32 @@ async function startServer() {
       let buffer: Buffer;
       let remoteUrl: string | null = null;
 
-      // Try Firebase Storage first when credentials are available.
+      // Try Firestore first when credentials are available (works on free Spark plan).
+      if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        try {
+          const ext = path.extname(fileName) || (fileType === "application/pdf" ? ".pdf" : "");
+          const baseName = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1E00-\u1EFF-]/g, "_").slice(0, 50);
+          const safeFileName = `${Date.now()}_${baseName}${ext}`;
+          const base64Data = fileData.replace(/^data:[^;]+;base64,/, "");
+          buffer = Buffer.from(base64Data, "base64");
+          if (buffer.length > 35 * 1024 * 1024) {
+            return res.status(413).json({ error: "Tệp tin vượt quá dung lượng tối đa 35MB" });
+          }
+          const fileUrl = await saveDocumentToFirestore(buffer, fileName, fileType, safeFileName);
+          return res.json({
+            success: true,
+            fileUrl,
+            name: fileName,
+            type: fileType || "application/octet-stream",
+            size: buffer.length,
+            storedIn: "firestore",
+          });
+        } catch (fsErr: any) {
+          console.error("Firestore document save failed, trying next store:", fsErr?.message);
+        }
+      }
+
+      // Next try Firebase Storage when credentials are available (needs Storage enabled).
       if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
         try {
           // Initialize Firebase Admin once per process, lazily.
