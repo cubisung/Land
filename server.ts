@@ -113,7 +113,7 @@ async function startServer() {
             const { getStorage } = await import("firebase-admin/storage");
             storage = getStorage();
           } catch {
-            const { initializeApp, cert, applicationDefault } = await import("firebase-admin/app");
+            const { initializeApp, cert, applicationDefault, getApps } = await import("firebase-admin/app");
             const { getStorage: getAdminStorage } = await import("firebase-admin/storage");
 
             if (getApps().length === 0) {
