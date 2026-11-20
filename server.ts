@@ -33,7 +33,9 @@ async function startServer() {
   }
 
   // Streaming Raw Document & PDF Upload API (Direct binary stream, zero base64 RAM overhead, up to 35MB)
-  app.post("/api/upload-document-raw", (req, res) => {
+  // When FIREBASE_SERVICE_ACCOUNT_JSON is set, the file is stored in Firebase
+  // Storage (survives Render restarts); otherwise it falls back to local disk.
+  app.post("/api/upload-document-raw", async (req, res) => {
     try {
       const rawName = (req.query.fileName as string) || (req.headers["x-file-name"] as string) || "tailieu.pdf";
       const rawType = (req.query.fileType as string) || (req.headers["x-file-type"] as string) || "application/pdf";
@@ -45,42 +47,87 @@ async function startServer() {
       const safeFileName = `${Date.now()}_${baseName}${ext}`;
       const filePath = path.join(uploadsDir, safeFileName);
 
-      const writeStream = fs.createWriteStream(filePath);
+      const chunks: Buffer[] = [];
       let receivedBytes = 0;
       const MAX_BYTES = 35 * 1024 * 1024;
       let limitExceeded = false;
 
       req.on("data", (chunk: Buffer) => {
+        if (limitExceeded) return;
         receivedBytes += chunk.length;
-        if (receivedBytes > MAX_BYTES && !limitExceeded) {
+        if (receivedBytes > MAX_BYTES) {
           limitExceeded = true;
           req.pause();
-          writeStream.destroy();
-          if (fs.existsSync(filePath)) {
-            try { fs.unlinkSync(filePath); } catch {}
-          }
           return res.status(413).json({ error: "Tệp tin vượt quá dung lượng tối đa 35MB" });
         }
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       });
 
-      req.pipe(writeStream);
-
-      writeStream.on("finish", () => {
+      req.on("end", async () => {
         if (limitExceeded) return;
-        const fileUrl = `/uploads/${safeFileName}`;
+        const buffer = Buffer.concat(chunks);
+
+        // Prefer Firebase Storage when credentials are available.
+        if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+          try {
+            const { initializeApp, cert, applicationDefault, getApps } = await import("firebase-admin/app");
+            const { getStorage } = await import("firebase-admin/storage");
+
+            if (getApps().length === 0) {
+              const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+              if (serviceAccountJson) {
+                initializeApp({
+                  credential: cert(JSON.parse(serviceAccountJson)),
+                  storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
+                });
+              } else {
+                initializeApp({
+                  credential: applicationDefault(),
+                  storageBucket: process.env.STORAGE_BUCKET || "qr-pricing-team-2026.firebasestorage.app",
+                });
+              }
+            }
+
+            const bucket = getStorage().bucket();
+            const file = bucket.file(`documents/${safeFileName}`);
+            await file.save(buffer, {
+              contentType: fileType || "application/octet-stream",
+              metadata: {
+                contentType: fileType || "application/octet-stream",
+                cacheControl: "public, max-age=31536000",
+              },
+            });
+            await file.makePublic();
+
+            return res.json({
+              success: true,
+              fileUrl: `https://storage.googleapis.com/${bucket.name}/${file.name}`,
+              name: fileName,
+              type: fileType || "application/octet-stream",
+              size: buffer.length,
+              storedIn: "firebaseStorage",
+            });
+          } catch (storageErr: any) {
+            console.error("Firebase Storage upload failed, falling back to local disk:", storageErr?.message);
+          }
+        }
+
+        // Fallback: save locally on the transient disk
+        fs.writeFileSync(filePath, buffer);
         return res.json({
           success: true,
-          fileUrl,
+          fileUrl: `/uploads/${safeFileName}`,
           name: fileName,
           type: fileType || "application/octet-stream",
-          size: receivedBytes,
+          size: buffer.length,
+          storedIn: "localDisk",
         });
       });
 
-      writeStream.on("error", (err) => {
-        console.error("Stream write error:", err);
+      req.on("error", (err) => {
+        console.error("Stream read error:", err);
         if (!res.headersSent) {
-          return res.status(500).json({ error: "Lỗi ghi tệp tin lên máy chủ: " + err?.message });
+          return res.status(500).json({ error: "Lỗi đọc tệp tin: " + (err as any)?.message });
         }
       });
     } catch (err: any) {
